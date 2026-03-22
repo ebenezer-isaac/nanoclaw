@@ -31,7 +31,8 @@ export function stripInternalTags(text: string): string {
 export function formatOutbound(rawText: string): string {
   const text = stripInternalTags(rawText);
   if (!text) return '';
-  return text;
+  // Strip markdown images — exfiltration vector (data encoded in URL)
+  return text.replace(/!\[[^\]]*\]\([^)]*\)/g, '[image removed]');
 }
 
 export function routeOutbound(

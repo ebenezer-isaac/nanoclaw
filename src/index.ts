@@ -10,6 +10,14 @@ import {
   TRIGGER_PATTERN,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
+import {
+  buildAllowedTools,
+  buildContainerSecurityRules,
+  isSenderTrusted,
+  loadSecurityPolicy,
+  readKillswitch,
+  SecurityPolicy,
+} from './security-policy.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -71,6 +79,7 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+let securityPolicy: SecurityPolicy;
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -157,6 +166,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
+  // Killswitch check for interactive messages
+  const ks = readKillswitch(securityPolicy, group.folder);
+  if (!ks.canRun) {
+    logger.info({ chatJid, folder: group.folder }, 'Killswitch active, refusing interactive message');
+    await channel.sendMessage(chatJid, ks.message);
+    return true;
+  }
+
   const isMainGroup = group.isMain === true;
 
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
@@ -180,6 +197,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
+
+  // Compute trust from verified sender ID (not display name)
+  const senderTrusted = missedMessages.some(
+    (m) => !m.is_from_me && isSenderTrusted(securityPolicy, m.sender),
+  );
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -218,8 +240,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         typeof result.result === 'string'
           ? result.result
           : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      const text = formatOutbound(raw);
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
         await channel.sendMessage(chatJid, text);
@@ -236,7 +257,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (result.status === 'error') {
       hadError = true;
     }
-  });
+  }, senderTrusted);
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -269,6 +290,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  senderTrusted?: boolean,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
@@ -319,10 +341,14 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        senderTrusted,
+        securityRules: buildContainerSecurityRules(securityPolicy),
+        allowedTools: buildAllowedTools(securityPolicy),
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
+      securityPolicy,
     );
 
     if (output.newSessionId) {
@@ -419,6 +445,13 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
+          // Killswitch check for message piping to active containers
+          const ksLoop = readKillswitch(securityPolicy, group.folder);
+          if (!ksLoop.canRun) {
+            await channel.sendMessage(chatJid, ksLoop.message);
+            continue;
+          }
+
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
@@ -471,6 +504,8 @@ function ensureContainerSystemRunning(): void {
 
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+  securityPolicy = loadSecurityPolicy();
+  logger.info('Security policy loaded');
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -614,9 +649,11 @@ async function main(): Promise<void> {
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: (jid, rawText) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      const text = formatOutbound(rawText);
+      if (!text) return Promise.resolve();
       return channel.sendMessage(jid, text);
     },
     registeredGroups: () => registeredGroups,

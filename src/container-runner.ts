@@ -27,6 +27,10 @@ import {
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
+import {
+  buildReadonlyOverlays,
+  ContainerSecurityRules,
+} from './security-policy.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -41,6 +45,9 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  senderTrusted?: boolean;
+  securityRules?: ContainerSecurityRules;
+  allowedTools?: string[];
 }
 
 export interface ContainerOutput {
@@ -59,6 +66,7 @@ interface VolumeMount {
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  policy: import('./security-policy.js').SecurityPolicy,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -196,8 +204,31 @@ function buildVolumeMounts(
   mounts.push({
     hostPath: groupAgentRunnerDir,
     containerPath: '/app/src',
-    readonly: false,
+    readonly: true,  // Prevent agent from modifying own MCP tool source
   });
+
+  // Protect skills directory from agent modification (persistent prompt injection)
+  const skillsDstPath = path.join(groupSessionsDir, 'skills');
+  if (fs.existsSync(skillsDstPath)) {
+    mounts.push({
+      hostPath: skillsDstPath,
+      containerPath: '/home/node/.claude/skills',
+      readonly: true,
+    });
+  }
+
+  // Protect settings.json from agent modification (SDK env var injection)
+  if (fs.existsSync(settingsFile)) {
+    mounts.push({
+      hostPath: settingsFile,
+      containerPath: '/home/node/.claude/settings.json',
+      readonly: true,
+    });
+  }
+
+  // Security policy: readonly overlays for config files (all groups)
+  const securityOverlays = buildReadonlyOverlays(policy, groupDir);
+  mounts.push(...securityOverlays);
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
@@ -269,13 +300,16 @@ export async function runContainerAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  policy?: import('./security-policy.js').SecurityPolicy,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  // Use provided policy or load defaults for mount overlay computation
+  const effectivePolicy = policy ?? (await import('./security-policy.js')).getDefaultPolicy();
+  const mounts = buildVolumeMounts(group, input.isMain, effectivePolicy);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
