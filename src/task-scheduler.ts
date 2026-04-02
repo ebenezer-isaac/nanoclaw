@@ -211,6 +211,7 @@ async function runTask(
           error = streamedOutput.error || 'Unknown error';
         }
       },
+      policy,
     );
 
     if (closeTimer) clearTimeout(closeTimer);

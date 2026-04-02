@@ -559,10 +559,15 @@ async function startMessageLoop(): Promise<void> {
             ASSISTANT_NAME,
             MAX_MESSAGES_PER_PROMPT,
           );
-          const messagesToSend = filterAuthorized(
-            allPending.length > 0 ? allPending : groupMessages,
-          );
-          if (messagesToSend.length === 0) continue;
+          const raw = allPending.length > 0 ? allPending : groupMessages;
+          const messagesToSend = filterAuthorized(raw);
+          if (messagesToSend.length === 0) {
+            // Advance cursor so unauthorized messages don't starve the window
+            if (raw.length > 0) {
+              lastAgentTimestamp[chatJid] = raw[raw.length - 1].timestamp;
+            }
+            continue;
+          }
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
           // Killswitch check for message piping to active containers
